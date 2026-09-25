@@ -18,6 +18,9 @@
     coyoteMs: 100,          // grace period to still jump after leaving ground
     jumpBufferMs: 120,      // jump pressed slightly early still counts on landing
     jumpCutVelocity: 5,     // releasing jump early cuts upward velocity (variable jump)
+    doubleJumpVelocity: 11, // upward velocity of the mid-air double jump
+    coinValue: 25,          // score bonus per coin
+    coinAfterScore: 100,    // coins start appearing after this score
     shieldAfterScore: 300,  // shields start appearing after this score
     dayNightCycle: 800,     // score points per full day/night loop
   };
@@ -27,6 +30,7 @@
   const GROUND_Y = 190;
   const HI_KEY = 'dino-run-hi';
   const MUTE_KEY = 'dino-run-muted';
+  const MISSIONS_KEY = 'dino-run-missions';
 
   const canvas = document.getElementById('game');
   const ctx = canvas.getContext('2d');
@@ -70,13 +74,23 @@
   function smooth(t) { return t * t * (3 - 2 * t); }
 
   // Day/night: 0 = day, 1 = night. Loops every CONFIG.dayNightCycle points.
+  // Sunset peaks in between so the sky melts through a warm gradient.
+  function skyPhase() {
+    return (score % CONFIG.dayNightCycle) / CONFIG.dayNightCycle; // 0..1
+  }
   function nightFactor() {
-    const c = CONFIG.dayNightCycle;
-    const p = (score % c) / c; // 0..1
+    const p = skyPhase();
     if (p < 0.55) return 0;
     if (p < 0.7) return smooth((p - 0.55) / 0.15);
     if (p < 0.9) return 1;
     return 1 - smooth((p - 0.9) / 0.1);
+  }
+  function sunsetFactor() {
+    const p = skyPhase();
+    if (p < 0.48 || p > 0.78) return 0;
+    if (p < 0.58) return smooth((p - 0.48) / 0.1);
+    if (p < 0.68) return 1;
+    return 1 - smooth((p - 0.68) / 0.1);
   }
   function applyPalette() {
     const n = nightFactor();
@@ -120,27 +134,58 @@
   // ---------- state ----------
 
   let state = 'ready'; // ready | running | paused | over
-  let dino, obstacles, clouds, stars, particles, floaters, powerups;
-  let speed, distance, score, bonus, nextSpawnIn, nextPowerIn;
+  let dino, obstacles, clouds, stars, particles, floaters, powerups, coins;
+  let speed, distance, score, bonus, coinCount, nextSpawnIn, nextPowerIn, nextCoinIn;
+  let runNearMisses, runCoins, runUnlocks;
   let gameOverAt, flashUntil, shakeUntil, invulnUntil, isNewBest;
   let hiScore = Number(storage.get(HI_KEY)) || 0;
   let dustTimer = 0;
 
+  // Missions: persisted unlocks + per-run progress
+  const MISSION_DEFS = [
+    { id: 'scout', name: 'SCOUT: reach 500 pts', check: () => score >= 500 },
+    { id: 'daredevil', name: 'DAREDEVIL: 3 near-misses in one run', check: () => runNearMisses >= 3 },
+    { id: 'collector', name: 'COLLECTOR: grab 5 coins in one run', check: () => runCoins >= 5 },
+  ];
+  let unlockedMissions = [];
+  try {
+    unlockedMissions = JSON.parse(storage.get(MISSIONS_KEY) || '[]');
+    if (!Array.isArray(unlockedMissions)) unlockedMissions = [];
+  } catch { unlockedMissions = []; }
+
+  function checkMissions() {
+    for (const m of MISSION_DEFS) {
+      if (!unlockedMissions.includes(m.id) && !runUnlocks.includes(m.id) && m.check()) {
+        runUnlocks.push(m.id);
+        unlockedMissions.push(m.id);
+        storage.set(MISSIONS_KEY, JSON.stringify(unlockedMissions));
+        floater(`MISSION: ${m.name}`, W / 2, 78);
+        jingle([523, 659, 784, 1047]);
+      }
+    }
+  }
+
   function reset() {
     dino = {
       x: 50, lift: 0, vy: 0, onGround: true, ducking: false,
-      squash: 1, coyoteAt: 0, bufferedAt: -9999, jumpHeld: false,
+      squash: 1, flip: 0, airJumps: 0, coyoteAt: 0, bufferedAt: -9999, jumpHeld: false,
     };
     obstacles = [];
     powerups = [];
+    coins = [];
     particles = [];
     floaters = [];
     speed = CONFIG.startSpeed;
     distance = 0;
     score = 0;
     bonus = 0;
+    coinCount = 0;
+    runNearMisses = 0;
+    runCoins = 0;
+    runUnlocks = [];
     nextSpawnIn = 400;
     nextPowerIn = 900;
+    nextCoinIn = 500;
     flashUntil = 0;
     shakeUntil = 0;
     invulnUntil = 0;
@@ -236,6 +281,21 @@
     nextPowerIn = speed * rand(160, 300);
   }
 
+  function spawnCoinLine() {
+    // arc of 5 coins: low arc reachable by jump, high arc needs double jump
+    const high = Math.random() < 0.4;
+    const baseY = high ? GROUND_Y - 120 : GROUND_Y - 60;
+    for (let i = 0; i < 5; i++) {
+      coins.push({
+        x: W + 10 + i * 34,
+        y: baseY - Math.sin((i / 4) * Math.PI) * 44,
+        baseY: baseY - Math.sin((i / 4) * Math.PI) * 44,
+        w: 16, h: 16, seed: rand(0, 6.28),
+      });
+    }
+    nextCoinIn = speed * rand(120, 220);
+  }
+
   // ---------- update ----------
 
   function jump() {
@@ -248,6 +308,15 @@
       dino.jumpHeld = true;
       dustPuff(2);
       beep(620, 0.05);
+    } else if (dino.airJumps < 1) {
+      // double jump: one extra hop mid-air with a flip
+      dino.airJumps += 1;
+      dino.vy = CONFIG.doubleJumpVelocity;
+      dino.flip = 1;
+      dino.squash = 1.2;
+      dino.jumpHeld = true;
+      burst(dino.x + 22, GROUND_Y - dino.lift, 10, 2, 3);
+      beep(780, 0.06);
     } else {
       dino.bufferedAt = now; // try again on landing
     }
@@ -275,8 +344,9 @@
     }
     score = newScore;
 
-    // squash recovery
+    // squash recovery + flip animation
     dino.squash += (1 - dino.squash) * Math.min(1, 0.18 * dt);
+    if (dino.flip > 0) dino.flip = Math.max(0, dino.flip - dt * 0.045);
 
     // dino physics (holding "down" mid-air = fast fall)
     if (!dino.onGround) {
@@ -288,6 +358,8 @@
         dino.vy = 0;
         dino.onGround = true;
         dino.coyoteAt = now;
+        dino.airJumps = 0;
+        dino.flip = 0;
         dino.squash = 0.68; // squash on land
         dustPuff(3);
         beep(200, 0.03);
@@ -318,6 +390,12 @@
       if (nextPowerIn <= 0) spawnShield();
     }
 
+    // coins
+    if (score >= CONFIG.coinAfterScore) {
+      nextCoinIn -= speed * dt;
+      if (nextCoinIn <= 0) spawnCoinLine();
+    }
+
     for (const o of obstacles) {
       o.x -= (o.type === 'bird' ? speed + 0.8 : speed) * dt;
       if (o.type === 'bird') o.y = o.baseY + Math.sin(now / 240 + o.seed) * 7;
@@ -329,6 +407,11 @@
       p.y += Math.sin(now / 300 + p.seed) * 0.3 * dt;
     }
     powerups = powerups.filter((p) => p.x + p.w > -20);
+    for (const c of coins) {
+      c.x -= speed * dt;
+      c.y = c.baseY + Math.sin(now / 280 + c.seed) * 3;
+    }
+    coins = coins.filter((c) => c.x + c.w > -20);
 
     // clouds
     for (const c of clouds) {
@@ -349,6 +432,21 @@
       }
     }
 
+    // coin pickup
+    for (let i = coins.length - 1; i >= 0; i--) {
+      const c = coins[i];
+      if (hits(d, c, 2)) {
+        coins.splice(i, 1);
+        coinCount += 1;
+        runCoins += 1;
+        bonus += CONFIG.coinValue;
+        score += CONFIG.coinValue;
+        burst(c.x + 8, c.y + 8, 8, 2, 3);
+        floater(`+${CONFIG.coinValue}`, c.x + 8, c.y - 10);
+        jingle([1320, 1760]);
+      }
+    }
+
     // near-miss bonus: obstacle just passed without hitting
     for (const o of obstacles) {
       if (!o.passed && o.x + o.w < d.x) {
@@ -360,6 +458,7 @@
         if (dy < 26) {
           bonus += 10;
           score += 10;
+          runNearMisses += 1;
           o.wobble = 18;
           floater('+10 NEAR MISS', d.x + 10, d.y - 12);
           beep(1200, 0.06);
@@ -368,6 +467,7 @@
     }
 
     updateParticles(dt);
+    checkMissions();
 
     // collision (skip while briefly invulnerable after shield save)
     if (now >= invulnUntil && obstacles.some((o) => hits(d, obstacleBox(o)))) {
@@ -429,10 +529,16 @@
       return;
     }
     const cx = b.x + b.w / 2;
+    const cy = b.y + b.h / 2;
     const bottom = b.y + b.h;
     const sy = Math.max(0.6, Math.min(1.4, dino.squash));
     const sx = 1 + (1 - sy) * 0.9;
     ctx.save();
+    if (!b.ducking && dino.flip > 0) {
+      ctx.translate(cx, cy);
+      ctx.rotate((1 - dino.flip) * Math.PI * 2);
+      ctx.translate(-cx, -cy);
+    }
     ctx.translate(cx, bottom);
     ctx.scale(sx, sy);
     ctx.translate(-cx, -bottom);
@@ -552,6 +658,47 @@
     rect(-2, -5, 4, 10);
     rect(-5, -2, 10, 4);
     ctx.restore();
+  }
+
+  function drawCoin(c) {
+    const pulse = 1 + Math.sin(performance.now() / 220 + c.seed) * 0.15;
+    ctx.save();
+    ctx.translate(c.x + 8, c.y + 8);
+    ctx.scale(pulse, pulse);
+    ctx.fillStyle = colors.ink;
+    // pixel diamond coin
+    rect(-3, -8, 6, 16);
+    rect(-6, -5, 12, 10);
+    rect(-8, -2, 16, 4);
+    ctx.fillStyle = colors.bg;
+    rect(-2, -4, 4, 8);
+    ctx.restore();
+  }
+
+  // Gradient sky: day -> warm sunset -> night, with travelling sun + moon
+  function drawSky(night, sunset) {
+    const top = mixHex(mixHex(baseColors.bg, '#ffd9a0', sunset * 0.55), '#0b1026', night);
+    const horizon = mixHex(mixHex(baseColors.bg, '#ff8c42', sunset * 0.75), NIGHT.bg, night);
+    const g = ctx.createLinearGradient(0, 0, 0, GROUND_Y);
+    g.addColorStop(0, top);
+    g.addColorStop(1, horizon);
+    ctx.fillStyle = g;
+    ctx.fillRect(-10, -10, W + 20, GROUND_Y + 10);
+
+    const p = skyPhase();
+    // sun arcs down as sunset approaches
+    if (night < 0.9) {
+      const t = Math.min(1, Math.max(0, (p - 0.25) / 0.45)); // 0→1 across afternoon
+      const sx = W - 90 - t * (W - 220);
+      const sy = 34 + Math.sin(t * Math.PI) * -6 + t * 78;
+      ctx.save();
+      ctx.globalAlpha = 1 - night;
+      ctx.fillStyle = mixHex('#ffc93c', '#ff6b35', sunset);
+      rect(sx - 9, sy - 9, 18, 18);
+      ctx.fillStyle = mixHex('#ffe89d', '#ffd9a0', sunset);
+      rect(sx - 5, sy - 5, 10, 10);
+      ctx.restore();
+    }
   }
 
   function drawCloud(c) {
@@ -676,15 +823,21 @@
     const flashing = performance.now() < flashUntil && Math.floor(performance.now() / 150) % 2 === 0;
     const current = flashing ? '' : pad(score);
     drawText(`HI ${pad(hiScore)}  ${current.padStart(5, ' ')}`, W - 20, 24, 12, 'right');
-    if (dino.shield) drawText('[SHIELD]', W - 20, 44, 8, 'right');
+    let subY = 44;
+    if (coinCount > 0) { drawText(`◉ ${coinCount}`, W - 20, subY, 8, 'right'); subY += 16; }
+    if (dino.shield) drawText('[SHIELD]', W - 20, subY, 8, 'right');
     if (CONFIG.githubUsername) {
       drawText(`@${CONFIG.githubUsername}`, 20, 24, 12, 'left');
     }
 
     if (state === 'ready') {
       const bounce = Math.sin(performance.now() / 350) * 4;
-      drawText(CONFIG.startText, W / 2, 88 + bounce, 12);
-      drawText('HOLD SPACE = HIGHER JUMP · P = PAUSE · M = MUTE', W / 2, 112, 8);
+      drawText(CONFIG.startText, W / 2, 82 + bounce, 12);
+      drawText('SPACE x2 = DOUBLE JUMP · HOLD = HIGHER · P = PAUSE · M = MUTE', W / 2, 104, 7);
+      MISSION_DEFS.forEach((m, i) => {
+        const done = unlockedMissions.includes(m.id);
+        drawText(`${done ? '★' : '·'} ${m.name}`, W / 2, 122 + i * 13, 7);
+      });
     } else if (state === 'paused') {
       drawText('PAUSED — PRESS P TO RESUME', W / 2, 90, 12);
     } else if (state === 'over') {
@@ -694,17 +847,23 @@
       ctx.fillStyle = colors.bg;
       ctx.fillRect(0, 0, W, H);
       ctx.restore();
-      const pw = 360;
-      const ph = isNewBest ? 108 : 92;
+      const pw = 380;
+      const ph = (isNewBest ? 108 : 92) + runUnlocks.length * 18;
       const px = W / 2 - pw / 2;
-      const py = 44;
+      const py = 40;
       roundPanel(px, py, pw, ph);
       ctx.fillStyle = colors.ink;
       drawText(CONFIG.gameOverText, W / 2, py + 22, 14);
       drawText(`SCORE ${pad(score)}   HI ${pad(hiScore)}`, W / 2, py + 48, 10);
+      let ly = py + 68;
       if (isNewBest) {
         const blink = Math.floor(performance.now() / 300) % 2 === 0;
-        if (blink) drawText('★ NEW BEST! ★', W / 2, py + 68, 10);
+        if (blink) drawText('★ NEW BEST! ★', W / 2, ly, 10);
+        ly += 20;
+      }
+      for (const id of runUnlocks) {
+        const m = MISSION_DEFS.find((x) => x.id === id);
+        if (m) { drawText(`★ ${m.name}`, W / 2, ly, 7); ly += 18; }
       }
       const showRestart = performance.now() - gameOverAt > 400;
       if (showRestart && Math.floor(performance.now() / 500) % 2 === 0) {
@@ -716,17 +875,20 @@
   function draw() {
     const now = performance.now();
     const night = applyPalette();
+    const sunset = sunsetFactor();
     ctx.save();
     if (now < shakeUntil) {
       const mag = state === 'over' ? 5 : 3;
       ctx.translate(rand(-mag, mag), rand(-mag, mag));
     }
+    drawSky(night, sunset);
     ctx.fillStyle = colors.bg;
-    ctx.fillRect(-10, -10, W + 20, H + 20);
+    ctx.fillRect(-10, GROUND_Y, W + 20, H - GROUND_Y + 10);
     drawParallax(night);
     clouds.forEach(drawCloud);
     drawGround();
     powerups.forEach(drawShieldPickup);
+    coins.forEach(drawCoin);
     obstacles.forEach(drawObstacle);
     drawParticles();
     drawDino();
@@ -821,6 +983,19 @@
     if (state === 'running') togglePause();
   });
 
+  function shareScore() {
+    const text = `I scored ${Math.floor(score)} in Dino Run (best ${Math.floor(hiScore)}). Can you beat me?`;
+    const done = () => floater('SCORE COPIED — GO BRAG!', W / 2, 90);
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, () => floater(`BEST ${pad(hiScore)} — SCREENSHOT IT!`, W / 2, 90));
+      } else {
+        floater(`BEST ${pad(hiScore)} — SCREENSHOT IT!`, W / 2, 90);
+      }
+    } catch { floater(`BEST ${pad(hiScore)} — SCREENSHOT IT!`, W / 2, 90); }
+    beep(990, 0.06);
+  }
+
   function syncButtons() {
     const pb = document.getElementById('btn-pause');
     const mb = document.getElementById('btn-mute');
@@ -830,8 +1005,21 @@
   function wireButtons() {
     const pb = document.getElementById('btn-pause');
     const mb = document.getElementById('btn-mute');
+    const sb = document.getElementById('btn-share');
+    const jb = document.getElementById('btn-jump');
+    const db = document.getElementById('btn-duck');
     if (pb) pb.addEventListener('click', (e) => { e.preventDefault(); togglePause(); canvas.focus(); });
     if (mb) mb.addEventListener('click', (e) => { e.preventDefault(); toggleMute(); canvas.focus(); });
+    if (sb) sb.addEventListener('click', (e) => { e.preventDefault(); shareScore(); canvas.focus(); });
+    if (jb) jb.addEventListener('pointerdown', (e) => { e.preventDefault(); primaryAction(); });
+    if (db) {
+      const on = (e) => { e.preventDefault(); dino.ducking = true; };
+      const off = (e) => { e.preventDefault(); dino.ducking = false; };
+      db.addEventListener('pointerdown', on);
+      db.addEventListener('pointerup', off);
+      db.addEventListener('pointercancel', off);
+      db.addEventListener('pointerleave', off);
+    }
   }
 
   // ---------- build info footer ----------
